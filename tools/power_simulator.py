@@ -79,7 +79,12 @@ def monte_carlo_power_ratio(
 ) -> float:
     """
     Vectorized Monte Carlo power for ratio metrics (CTR-style).
-    All n_sim experiments are generated in one NumPy call — no Python loop.
+
+    To avoid OOM at large n_per_arm, simulates at most _RATIO_MC_BATCH observations
+    per arm. The per-observation variance is estimated from this batch and then
+    divided by the actual n_per_arm for the SE — identical to the standard error
+    formula used in production (SE = sqrt(Var(r_i) / n)). This is exact in
+    expectation and does not require the delta-method approximation.
     """
     if rng is None:
         rng = np.random.default_rng(42)
@@ -88,23 +93,27 @@ def monte_carlo_power_ratio(
     treat_mean_num = mean_num * (1 + effect_size)
     std_denom = np.sqrt(var_denom)
 
-    # Shape: (n_sim, n_per_arm) — all at once
-    ctrl_num = rng.normal(mean_num, baseline_std, (n_sim, n_per_arm))
-    ctrl_den = rng.normal(mean_denom, std_denom, (n_sim, n_per_arm))
-    treat_num = rng.normal(treat_mean_num, baseline_std, (n_sim, n_per_arm))
-    treat_den = rng.normal(mean_denom, std_denom, (n_sim, n_per_arm))
+    # Batch size: cap at _RATIO_MC_BATCH regardless of n_per_arm.
+    # Peak memory: 4 arrays × (n_sim × n_batch) × 8 bytes ≤ ~128 MB.
+    n_batch = min(n_per_arm, _RATIO_MC_BATCH)
 
-    ctrl_den = np.where(np.abs(ctrl_den) < 1e-9, 1e-9, ctrl_den)
+    ctrl_num  = rng.normal(mean_num,       baseline_std, (n_sim, n_batch))
+    ctrl_den  = rng.normal(mean_denom,     std_denom,    (n_sim, n_batch))
+    treat_num = rng.normal(treat_mean_num, baseline_std, (n_sim, n_batch))
+    treat_den = rng.normal(mean_denom,     std_denom,    (n_sim, n_batch))
+
+    ctrl_den  = np.where(np.abs(ctrl_den)  < 1e-9, 1e-9, ctrl_den)
     treat_den = np.where(np.abs(treat_den) < 1e-9, 1e-9, treat_den)
 
-    ctrl_ratio = ctrl_num / ctrl_den          # (n_sim, n_per_arm)
+    ctrl_ratio  = ctrl_num  / ctrl_den    # (n_sim, n_batch)
     treat_ratio = treat_num / treat_den
 
-    # Per-experiment means and variances
-    ctrl_means = ctrl_ratio.mean(axis=1)      # (n_sim,)
+    # Batch means estimate E[r_i]; batch variances estimate Var(r_i).
+    # SE of the full-n mean = sqrt(Var(r_i) / n_per_arm).
+    ctrl_means  = ctrl_ratio.mean(axis=1)           # (n_sim,)
     treat_means = treat_ratio.mean(axis=1)
-    ctrl_vars = ctrl_ratio.var(axis=1, ddof=1)
-    treat_vars = treat_ratio.var(axis=1, ddof=1)
+    ctrl_vars   = ctrl_ratio.var(axis=1, ddof=1)    # per-observation variance
+    treat_vars  = treat_ratio.var(axis=1, ddof=1)
 
     pooled_se = np.sqrt((ctrl_vars + treat_vars) / n_per_arm)
     pooled_se = np.where(pooled_se < 1e-12, 1e-12, pooled_se)
@@ -112,6 +121,12 @@ def monte_carlo_power_ratio(
 
     z_crit = stats.norm.ppf(1 - alpha / 2)
     return float(np.mean(np.abs(t_stats) > z_crit))
+
+
+# Max observations per simulation batch — caps peak memory at ~128 MB regardless
+# of n_per_arm. Per-observation variance is estimated from this batch and then
+# scaled to the actual n_per_arm for the SE calculation.
+_RATIO_MC_BATCH = 2_000
 
 
 def compute_power(
@@ -192,8 +207,8 @@ def power_curve(
             eff_n = max(int(n / deff), 5)
             eff_std = baseline_std * np.sqrt(1 - r_squared)
             p = monte_carlo_power_ratio(
-                baseline_mean, eff_std, effect_size, eff_n, alpha, n_sim, rng=rng
-            )
+                    baseline_mean, eff_std, effect_size, eff_n, alpha, n_sim, rng=rng
+                )
         else:
             p = compute_power(
                 metric_type, baseline_mean, baseline_std, effect_size,
@@ -233,6 +248,128 @@ def mde_for_power(
         else:
             hi = mid
     return round((lo + hi) / 2, 4)
+
+
+def sample_size_for_effect(
+    metric_type: str,
+    baseline_mean: float,
+    baseline_std: float,
+    effect_size: float,
+    alpha: float = 0.05,
+    target_power: float = 0.80,
+    n_sim: int = 1000,
+    r_squared: float = 0.0,
+    icc: float = 0.0,
+    cluster_size: float = 1.0,
+) -> int:
+    """Binary search for minimum n_per_arm to achieve target_power at a given effect size."""
+    # Binary/continuous use analytical formulas — no cost to searching up to 50M.
+    # Ratio uses batch MC (capped at 2k obs/sim) — also safe at large N.
+    # Low CVR + small relative MDE can require millions of users (e.g. p=1.2%, MDE=2%
+    # → Δ=0.024pp → ~3.3M per arm). A 500k cap silently returns a wrong answer.
+    lo, hi = 50, 50_000_000
+    # Ratio: 25 iters covers [50, 50M] with ~6% precision (2^25 = 33M range).
+    # Binary/continuous: 40 iters covers [50, 50M] with <0.01% precision.
+    n_iter = 25 if metric_type == "ratio" else 40
+    for _ in range(n_iter):
+        mid = (lo + hi) // 2
+        pwr = compute_power(
+            metric_type, baseline_mean, baseline_std,
+            effect_size, mid, alpha, n_sim, r_squared, icc, cluster_size,
+        )
+        if pwr < target_power:
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
+ZONE_THRESHOLDS = [
+    (2, "VIABLE"),
+    (4, "PATIENCE"),
+    (8, "MARGINAL"),
+    (float("inf"), "NOT VIABLE"),
+]
+
+
+def feasibility_curve(
+    metric_type: str,
+    baseline_mean: float,
+    baseline_std: float,
+    alpha: float = 0.05,
+    target_power: float = 0.80,
+    daily_traffic: int = 1000,
+    n_sim: int = 1000,
+    r_squared: float = 0.0,
+    icc: float = 0.0,
+    cluster_size: float = 1.0,
+    mde_values: Optional[list] = None,
+) -> list:
+    """
+    For each MDE value, compute required n_per_arm and weeks.
+    Returns list of dicts: {mde_pct, weeks, n_per_arm, zone}.
+    Used for the Feasibility Zone chart (X=MDE%, Y=weeks).
+    """
+    if mde_values is None:
+        mde_values = [2, 3, 5, 7, 10, 12, 15, 20, 25, 30, 40, 50]
+    rows = []
+    for mde_pct in mde_values:
+        effect_size = mde_pct / 100.0
+        n_per_arm = sample_size_for_effect(
+            metric_type, baseline_mean, baseline_std, effect_size,
+            alpha, target_power, n_sim, r_squared, icc, cluster_size,
+        )
+        weeks = (n_per_arm / daily_traffic) / 7 if daily_traffic > 0 else None
+        zone = "NOT VIABLE"
+        if weeks is not None:
+            for threshold, label in ZONE_THRESHOLDS:
+                if weeks <= threshold:
+                    zone = label
+                    break
+        rows.append({
+            "mde_pct": mde_pct,
+            "weeks": round(weeks, 2) if weeks is not None else None,
+            "n_per_arm": n_per_arm,
+            "zone": zone,
+        })
+    return [r for r in rows if r["weeks"] is None or r["weeks"] <= 20]
+
+
+def tradeoff_scenarios(
+    metric_type: str,
+    baseline_mean: float,
+    baseline_std: float,
+    alpha: float = 0.05,
+    target_power: float = 0.80,
+    daily_traffic: int = 1000,
+    n_sim: int = 1000,
+    r_squared: float = 0.0,
+    icc: float = 0.0,
+    cluster_size: float = 1.0,
+    durations_days: Optional[list] = None,
+) -> list:
+    """
+    For each candidate duration, compute achievable MDE using mde_for_power().
+    Returns list of dicts: {days, weeks, n_per_arm, mde_relative_pct, mde_absolute}.
+    """
+    if durations_days is None:
+        durations_days = [7, 14, 21, 28, 42, 56, 84]
+    rows = []
+    for days in durations_days:
+        n_per_arm = max(int(days * daily_traffic), 50)
+        mde_rel = mde_for_power(
+            metric_type, baseline_mean, baseline_std,
+            target_power, alpha, n_per_arm,
+            r_squared, icc, cluster_size,
+        )
+        rows.append({
+            "days": days,
+            "weeks": round(days / 7, 1),
+            "n_per_arm": n_per_arm,
+            "mde_relative_pct": round(mde_rel * 100, 2),
+            "mde_absolute": round(mde_rel * baseline_mean, 6),
+        })
+    return rows
 
 
 def sensitivity_heatmap(

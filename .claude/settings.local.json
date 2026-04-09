@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(head -10 grep -n \"st\\\\.button\\\\|Run\\\\|session_state\" /Users/hyunjoonbok/dev/public/experiment-tool/ui/tab_causal.py)",
+      "Bash(head -15 grep -n \"session_state\\\\|st\\\\.button\" /Users/hyunjoonbok/dev/public/experiment-tool/ui/tab_causal.py)"
     ]
   }
 }
