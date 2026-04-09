@@ -43,6 +43,17 @@ def pocock_z_boundary(K: int, alpha: float = 0.05) -> float:
     return float((lo + hi) / 2)
 
 
+def haybittle_peto_z(K: int, alpha: float = 0.05) -> tuple[float, float]:
+    """
+    Haybittle-Peto boundary: z=3.29 at all interim looks (α≈0.001 each),
+    z_α at the final look. Returns (interim_z, final_z).
+    """
+    interim_z = 3.29
+    # Final look z chosen so overall type I ≤ alpha; standard practice is just z_α
+    final_z = float(stats.norm.ppf(1 - alpha / 2))
+    return interim_z, final_z
+
+
 def alpha_spending_table(
     K: int,
     boundary: str = "obrien_fleming",
@@ -75,6 +86,21 @@ def alpha_spending_table(
                 "cumulative_alpha_spent": round(cumulative, 5),
                 "incremental_alpha": round(p_each, 5),
                 "z_boundary": round(c, 3),
+            })
+    elif boundary == "haybittle_peto":
+        interim_z, final_z = haybittle_peto_z(K, alpha)
+        p_interim = float(2 * (1 - stats.norm.cdf(interim_z)))
+        p_final = float(2 * (1 - stats.norm.cdf(final_z)))
+        for k in range(1, K + 1):
+            z_b = final_z if k == K else interim_z
+            p_k = p_final if k == K else p_interim
+            cumulative = min(cumulative + p_k, alpha)
+            rows.append({
+                "look": k,
+                "fraction_observed": round(k / K, 3),
+                "cumulative_alpha_spent": round(cumulative, 5),
+                "incremental_alpha": round(p_k, 5),
+                "z_boundary": round(z_b, 3),
             })
     else:  # fixed — no correction
         z_alpha = stats.norm.ppf(1 - alpha / 2)
@@ -113,6 +139,9 @@ def simulate_type1_inflation(
     elif boundary == "pocock":
         c = pocock_z_boundary(K, alpha)
         z_bounds = np.full(K, c)
+    elif boundary == "haybittle_peto":
+        interim_z, final_z = haybittle_peto_z(K, alpha)
+        z_bounds = np.array([final_z if k == K else interim_z for k in range(1, K + 1)])
     else:
         z_bounds = np.full(K, stats.norm.ppf(1 - alpha / 2))
 
@@ -175,6 +204,9 @@ def simulate_power_sequential(
     elif boundary == "pocock":
         c = pocock_z_boundary(K, alpha)
         z_bounds = np.full(K, c)
+    elif boundary == "haybittle_peto":
+        interim_z, final_z = haybittle_peto_z(K, alpha)
+        z_bounds = np.array([final_z if k == K else interim_z for k in range(1, K + 1)])
     else:
         z_bounds = np.full(K, stats.norm.ppf(1 - alpha / 2))
 
@@ -183,7 +215,8 @@ def simulate_power_sequential(
     treat_all = rng.normal(true_effect / baseline_std, 1.0, (n_sim, n_per_arm))
 
     rejections = 0
-    stopping_looks = np.full(n_sim, K, dtype=int)
+    ever_rejected = np.zeros(n_sim, dtype=bool)
+    stopping_looks = np.zeros(n_sim, dtype=int)  # 0 = never rejected
     already_stopped = np.zeros(n_sim, dtype=bool)
     look_rejections = np.zeros(K, dtype=int)
 
@@ -198,12 +231,20 @@ def simulate_power_sequential(
         rejections += n_new
         look_rejections[i] += n_new
         stopping_looks[new_reject] = i + 1
+        ever_rejected |= new_reject
         already_stopped |= reject_now
+
+    # Expected stopping look computed only over experiments that actually rejected
+    if ever_rejected.any():
+        expected_stop = round(float(stopping_looks[ever_rejected].mean()), 2)
+    else:
+        expected_stop = float(K)
 
     return {
         "power": round(rejections / n_sim, 4),
-        "expected_stopping_look": round(float(stopping_looks.mean()), 2),
+        "expected_stopping_look": expected_stop,
         "stopping_look_distribution": look_rejections.tolist(),
         "looks": list(range(1, K + 1)),
         "boundary": boundary,
+        "n_never_rejected": int(n_sim - ever_rejected.sum()),
     }

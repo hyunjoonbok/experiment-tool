@@ -18,7 +18,7 @@ class DiDResult:
     se: float
     ci_low: float
     ci_high: float
-    covers_truth: bool
+    ci_coverage: float   # empirical 95% CI coverage rate across simulations
     power: float
 
 
@@ -72,20 +72,34 @@ def estimate_did(
     treated: np.ndarray,
     time: np.ndarray,
     n_pre: int,
-) -> DiDResult:
+) -> tuple[float, float]:
     """
-    Estimate 2×2 DiD using OLS with unit and time fixed effects (within estimator).
-    Returns DiDResult with bias, SE, CI, and coverage.
+    Estimate DiD using the within estimator (unit FE absorbed by demeaning).
+    Regresses unit-demeaned Y on unit-demeaned (treat×post) and (post) to control
+    for unit fixed effects and the common time trend respectively.
+    Returns (estimate, se).
     """
     n_obs = len(Y)
+    n_periods = int(time.max()) + 1
+    n_units = n_obs // n_periods
+    unit_ids = np.arange(n_obs) // n_periods
+
     post = (time >= n_pre).astype(float)
     interact = treated * post
 
-    # Demean within units for unit FE (within transformation)
-    # Build X: [post, treat×post, intercept]
-    X = np.column_stack([post, interact, np.ones(n_obs)])
+    # Within-unit demeaning: removes unit fixed effects from all variables
+    Y_dm = Y.astype(float).copy()
+    interact_dm = interact.astype(float).copy()
+    post_dm = post.astype(float).copy()
+    for u in range(n_units):
+        mask = unit_ids == u
+        Y_dm[mask] -= Y_dm[mask].mean()
+        interact_dm[mask] -= interact_dm[mask].mean()
+        post_dm[mask] -= post_dm[mask].mean()
+
+    X = np.column_stack([interact_dm, post_dm])
     XtX = X.T @ X
-    XtY = X.T @ Y
+    XtY = X.T @ Y_dm
     try:
         beta = np.linalg.solve(XtX, XtY)
     except np.linalg.LinAlgError:
@@ -94,22 +108,22 @@ def estimate_did(
     if not np.all(np.isfinite(beta)):
         return 0.0, 1.0
 
-    resid = Y - X @ beta
-    n_params = X.shape[1]
-    dof = n_obs - n_params
+    resid = Y_dm - X @ beta
+    # DOF: subtract absorbed unit FE and explicit regressors
+    dof = max(n_obs - n_units - X.shape[1], 1)
     rtr = resid @ resid
-    if not np.isfinite(rtr) or dof <= 0:
+    if not np.isfinite(rtr):
         return 0.0, 1.0
 
     sigma2 = rtr / dof
     try:
         cov_mat = sigma2 * np.linalg.inv(XtX)
     except np.linalg.LinAlgError:
-        return float(beta[1]), 1.0
+        return float(beta[0]), 1.0
 
-    se_val = cov_mat[1, 1]
+    se_val = cov_mat[0, 0]
     se = float(np.sqrt(se_val)) if np.isfinite(se_val) and se_val > 0 else 1.0
-    est = float(beta[1]) if np.isfinite(beta[1]) else 0.0
+    est = float(beta[0]) if np.isfinite(beta[0]) else 0.0
     return est, se
 
 
@@ -160,7 +174,7 @@ def simulate_did(
         se=round(mean_se, 4),
         ci_low=round(ci_low, 4),
         ci_high=round(ci_high, 4),
-        covers_truth=bool(ci_low <= true_effect <= ci_high),
+        ci_coverage=round(float(covers), 4),  # empirical coverage across all simulations
         power=round(power, 4),
     )
 
@@ -212,7 +226,7 @@ def bias_vs_violation(
             "bias": result.bias,
             "bias_pct": result.bias_pct,
             "power": result.power,
-            "ci_coverage": result.covers_truth,
+            "ci_coverage": result.ci_coverage,
         })
     return rows
 
