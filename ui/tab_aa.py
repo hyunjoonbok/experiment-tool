@@ -313,15 +313,19 @@ def _render_simulation():
         )
         fp_table = multi_metric_fp_table(alpha, r_n_sim, max_metrics=10)
         df_fp = pd.DataFrame(fp_table)
+        def _fwer_color(val):
+            # Green → Yellow → Red as FWER goes 0 → 1 (no matplotlib needed)
+            r = int(255 * min(val * 2, 1))
+            g = int(255 * min((1 - val) * 2, 1))
+            return f"background-color: rgb({r},{g},80); color: #1e293b"
+
         st.dataframe(
             df_fp.style.format({
                 "FWER (no correction)": "{:.1%}",
                 "Expected false positive runs": "{:.0f}",
                 "Avg false positive metrics / experiment": "{:.2f}",
                 "Bonferroni threshold per metric": "{:.5f}",
-            }).background_gradient(
-                subset=["FWER (no correction)"], cmap="RdYlGn_r", vmin=0, vmax=1
-            ),
+            }).map(_fwer_color, subset=["FWER (no correction)"]),
             width="stretch",
             hide_index=True,
         )
