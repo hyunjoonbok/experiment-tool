@@ -10,8 +10,9 @@ from tools.power_simulator import (
     sample_size_for_effect,
     feasibility_curve,
     sensitivity_heatmap,
+    subgroup_mde_table,
 )
-from utils.charts import feasibility_zone_chart, power_matrix_chart
+from utils.charts import feasibility_zone_chart, power_matrix_chart, subgroup_mde_chart
 
 
 # ── Helpers ───────────────────────────────────────────────
@@ -614,6 +615,195 @@ accepting a wider MDE (right on the curve) would still answer the product questi
 """)
 
 
+# ── Sub-tab 4: Subgroup Power ─────────────────────────────
+
+_DEFAULT_SEG_NAMES = ["iOS users", "Android users", "New users",
+                      "Power users", "Mobile web", "Desktop"]
+_DEFAULT_SEG_FRACS = [40, 60, 25, 15, 30, 50]
+
+
+def _render_subgroup_sub(p: dict) -> None:
+    st.markdown("**Subgroup analysis degrades sensitivity — quantify the cost before you launch.**")
+    st.caption(
+        "Each subgroup contains only a fraction of your total traffic, so it has fewer users "
+        "per arm and a larger implied MDE. Enter your planned segments below to see exactly "
+        "how sensitive (or insensitive) each one is at your target power."
+    )
+
+    # ── Pull overall N + MDE from whichever prior sub-tab ran ─────────────
+    default_n   = 5_000
+    default_mde = 10.0   # %
+
+    if "pwr_sens_results" in st.session_state:
+        r = st.session_state["pwr_sens_results"]
+        default_n   = r["n_per_arm"]
+        default_mde = round(r["mde_rel"] * 100, 2)
+    elif "pwr_dur_results" in st.session_state:
+        r = st.session_state["pwr_dur_results"]
+        default_n   = r["n_per_arm"]
+        default_mde = float(r["mde_pct"])
+    elif "pwr_ss_results" in st.session_state:
+        r = st.session_state["pwr_ss_results"]
+        default_n   = r["n_per_arm"]
+        default_mde = float(r["mde_pct"])
+
+    col1, col2 = st.columns(2)
+    with col1:
+        overall_n = st.number_input(
+            "Overall N per arm",
+            min_value=50, value=int(default_n), step=500,
+            help=(
+                "Total users per arm in the full experiment. "
+                "Pre-populated from any prior calculation in this tab; edit manually if needed."
+            ),
+            key="pwr_sub_n",
+        )
+    with col2:
+        overall_mde = st.number_input(
+            "Overall MDE (%)",
+            min_value=0.1, max_value=100.0, value=float(default_mde),
+            step=0.5, format="%.1f",
+            help="The minimum detectable effect for the overall experiment (% relative lift).",
+            key="pwr_sub_mde",
+        )
+
+    st.divider()
+    st.subheader("Define Segments")
+    n_segments = st.slider(
+        "Number of segments", 2, 6, 3,
+        key="pwr_sub_n_segs",
+        help="How many subgroups do you plan to analyse separately?",
+    )
+
+    segments = []
+    seg_cols = st.columns(2)
+    for i in range(n_segments):
+        with seg_cols[i % 2]:
+            inner = st.columns([3, 2])
+            name = inner[0].text_input(
+                f"Segment {i+1} name",
+                value=_DEFAULT_SEG_NAMES[i] if i < len(_DEFAULT_SEG_NAMES) else f"Segment {i+1}",
+                key=f"pwr_sub_name_{i}",
+            )
+            frac_pct = inner[1].number_input(
+                "Traffic %",
+                min_value=1, max_value=100,
+                value=_DEFAULT_SEG_FRACS[i] if i < len(_DEFAULT_SEG_FRACS) else 50,
+                step=5,
+                key=f"pwr_sub_frac_{i}",
+            )
+            segments.append({"name": name or f"Segment {i+1}", "fraction": frac_pct / 100.0})
+
+    run = st.button("Compute Subgroup MDEs", type="primary", key="run_sub")
+
+    if run:
+        overall_mde_rel = overall_mde / 100.0
+        with st.spinner("Computing implied MDEs..."):
+            rows = subgroup_mde_table(
+                metric_type=p["metric_type"],
+                baseline_mean=p["baseline_mean"],
+                baseline_std=p["baseline_std"],
+                overall_n_per_arm=int(overall_n),
+                overall_mde_rel=overall_mde_rel,
+                segments=segments,
+                alpha=p["alpha"],
+                target_power=p["target_power"],
+                n_sim=p["n_sim"],
+                r_squared=p["r_squared"],
+                icc=p["icc"],
+                cluster_size=p["cluster_size"],
+            )
+        st.session_state["pwr_sub_results"] = {
+            "rows": rows,
+            "overall_n": int(overall_n),
+            "overall_mde": overall_mde,
+            "_params_key": _params_key(p),
+        }
+
+    if "pwr_sub_results" in st.session_state:
+        res = st.session_state["pwr_sub_results"]
+
+        if res.get("_params_key") != _params_key(p):
+            st.warning(
+                "⚠️ Shared settings changed since last run — "
+                "click **Compute Subgroup MDEs** to refresh."
+            )
+
+        rows = res["rows"]
+        overall_mde_val = res["overall_mde"]
+
+        # ── Scorecard ──────────────────────────────────────────────────────
+        st.divider()
+        n_powered = sum(1 for r in rows if r["adequately_powered"])
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("Segments defined", len(rows))
+        sc2.metric(
+            "Adequately powered ✓", n_powered,
+            delta=None if n_powered == len(rows) else f"{len(rows) - n_powered} underpowered",
+            delta_color="off" if n_powered == len(rows) else "inverse",
+        )
+        sc3.metric("Overall MDE", f"{overall_mde_val:.1f}%")
+
+        # ── Bar chart ──────────────────────────────────────────────────────
+        st.altair_chart(
+            subgroup_mde_chart(rows, overall_mde_pct=overall_mde_val,
+                               target_power=p["target_power"]),
+            width="stretch",
+        )
+
+        # ── Detail table ───────────────────────────────────────────────────
+        def _power_color(val):
+            if val >= p["target_power"]:
+                return "background-color: #d1fae5; color: #065f46"
+            elif val >= p["target_power"] * 0.75:
+                return "background-color: #fef3c7; color: #92400e"
+            return "background-color: #fee2e2; color: #991b1b"
+
+        power_col = f"Power at {overall_mde_val:.1f}% MDE"
+        df_sub = pd.DataFrame([{
+            "Segment":       r["segment"],
+            "Traffic share": f"{r['fraction']:.0%}",
+            "N per arm":     r["n_per_arm"],
+            "Implied MDE":   f"{r['implied_mde_pct']:.2f}%",
+            "vs. Overall":   (f"+{r['mde_delta_pp']:.2f} pp" if r["mde_delta_pp"] >= 0
+                              else f"{r['mde_delta_pp']:.2f} pp"),
+            power_col:       r["power_at_overall_mde"],
+        } for r in rows])
+
+        st.dataframe(
+            df_sub.style
+            .map(_power_color, subset=[power_col])
+            .format({power_col: "{:.0%}"}),
+            width="stretch",
+            hide_index=True,
+        )
+
+        # ── Interpretation ─────────────────────────────────────────────────
+        with st.expander("📊 How to interpret this table", expanded=False):
+            st.markdown(f"""
+**Implied MDE** — The smallest effect detectable *within that segment alone* at
+**{p['target_power']:.0%} power**. Smaller segments → fewer users → larger implied MDE → worse sensitivity.
+This is expected and not a flaw in your design.
+
+**vs. Overall** — How many percentage points larger the segment's MDE is compared to the
+full-experiment threshold. A "+8 pp" means that segment needs an effect 8 pp larger than
+your overall target to be detectable at the same power level.
+
+**{power_col}** — If the true effect is exactly the overall MDE ({overall_mde_val:.1f}%),
+this is the probability of detecting it *within that segment*.
+- **Green (≥ {p['target_power']:.0%})**: Safe to draw segment-level conclusions at the overall threshold.
+- **Yellow (≥ {p['target_power']*0.75:.0%})**: Marginal — treat as directional only.
+- **Red (< {p['target_power']*0.75:.0%})**: Effectively blind to an effect at the overall MDE size.
+
+**What to do with red/yellow segments:**
+- Report them as *directional* (consistent with the overall result) rather than independently significant.
+- If a segment conclusion is critical to the shipping decision, re-power the experiment targeting that
+  segment's implied MDE — not the overall MDE.
+- If all segments are red: your subgroup ambitions exceed the traffic budget. Narrow to fewer segments,
+  increase overall runtime, or pre-register only the primary metric for segment analysis.
+""")
+
+
 # ── Main Entry Point ──────────────────────────────────────
 
 def render():
@@ -680,10 +870,11 @@ def render():
 
     st.divider()
 
-    sub1, sub2, sub3 = st.tabs([
+    sub1, sub2, sub3, sub4 = st.tabs([
         "⏱ How long to run?",
         "🎯 What can I detect?",
         "👥 How many users?",
+        "🔍 Subgroup Power",
     ])
 
     with sub1:
@@ -694,3 +885,6 @@ def render():
 
     with sub3:
         _render_samplesize_sub(p)
+
+    with sub4:
+        _render_subgroup_sub(p)

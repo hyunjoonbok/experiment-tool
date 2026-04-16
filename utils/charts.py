@@ -867,3 +867,66 @@ def results_traffic_chart(metric_data: list, ctrl_name: str, treat_name: str) ->
         height=240,
         title="Traffic Distribution per Arm",
     ).configure_view(strokeWidth=0)
+
+
+def subgroup_mde_chart(rows: list, overall_mde_pct: float, target_power: float = 0.80) -> alt.Chart:
+    """
+    Horizontal bar chart showing implied MDE per segment.
+    Green = adequately powered at the overall MDE; orange = underpowered.
+    Dashed vertical line marks the overall experiment MDE.
+    """
+    df = pd.DataFrame(rows)
+
+    color_scale = alt.Scale(domain=[True, False], range=["#059669", "#f97316"])
+
+    bars = (
+        alt.Chart(df)
+        .mark_bar(height=28, cornerRadiusEnd=4)
+        .encode(
+            x=alt.X("implied_mde_pct:Q",
+                    title="Implied MDE at target power (%)",
+                    scale=alt.Scale(zero=True)),
+            y=alt.Y("segment:N",
+                    sort=alt.SortField("implied_mde_pct", order="ascending"),
+                    title=None),
+            color=alt.Color("adequately_powered:N",
+                            scale=color_scale,
+                            legend=alt.Legend(title="Powered at overall MDE?")),
+            tooltip=[
+                alt.Tooltip("segment:N", title="Segment"),
+                alt.Tooltip("fraction:Q", title="Traffic share", format=".0%"),
+                alt.Tooltip("n_per_arm:Q", title="N per arm", format=","),
+                alt.Tooltip("implied_mde_pct:Q", title="Implied MDE (%)", format=".2f"),
+                alt.Tooltip("mde_delta_pp:Q", title="vs. overall MDE (pp)", format="+.2f"),
+                alt.Tooltip("power_at_overall_mde:Q", title="Power at overall MDE", format=".0%"),
+            ],
+        )
+    )
+
+    labels = bars.mark_text(align="left", dx=4, fontSize=11).encode(
+        text=alt.Text("implied_mde_pct:Q", format=".1f"),
+        color=alt.value("#1e293b"),
+    )
+
+    ref_df = pd.DataFrame([{"overall": overall_mde_pct}])
+    ref_line = (
+        alt.Chart(ref_df)
+        .mark_rule(color="#1e293b", strokeWidth=2, strokeDash=[6, 3])
+        .encode(x="overall:Q")
+    )
+    ref_label = (
+        alt.Chart(ref_df)
+        .mark_text(align="left", dx=4, dy=-6, fontSize=10,
+                   color="#1e293b", fontWeight="bold")
+        .encode(
+            x="overall:Q",
+            y=alt.value(8),
+            text=alt.value(f"Overall MDE: {overall_mde_pct:.1f}%"),
+        )
+    )
+
+    return (
+        (bars + labels + ref_line + ref_label)
+        .properties(height=max(40 * len(rows), 120))
+        .configure_view(strokeWidth=0)
+    )

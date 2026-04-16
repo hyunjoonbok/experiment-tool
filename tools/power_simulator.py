@@ -401,3 +401,52 @@ def sensitivity_heatmap(
                 "power": round(p, 3),
             })
     return rows
+
+
+def subgroup_mde_table(
+    metric_type: str,
+    baseline_mean: float,
+    baseline_std: float,
+    overall_n_per_arm: int,
+    overall_mde_rel: float,
+    segments: list,
+    alpha: float = 0.05,
+    target_power: float = 0.80,
+    n_sim: int = 1000,
+    r_squared: float = 0.0,
+    icc: float = 0.0,
+    cluster_size: float = 1.0,
+) -> list:
+    """
+    For each segment (fraction of overall traffic per arm), compute:
+      - n_per_arm            : users per arm in that segment
+      - implied_mde_pct      : smallest detectable effect at target_power
+      - mde_delta_pp         : pp difference vs overall MDE
+      - power_at_overall_mde : power the segment has at the overall MDE threshold
+      - adequately_powered   : True if power_at_overall_mde >= target_power
+
+    segments: [{"name": str, "fraction": float}, ...]
+    overall_mde_rel: fraction (e.g. 0.10 for 10%)
+    Returns list sorted by implied_mde_pct ascending.
+    """
+    rows = []
+    for seg in segments:
+        n_seg = max(int(overall_n_per_arm * seg["fraction"]), 50)
+        implied_mde = mde_for_power(
+            metric_type, baseline_mean, baseline_std,
+            target_power, alpha, n_seg, r_squared, icc, cluster_size,
+        )
+        power_at_overall = compute_power(
+            metric_type, baseline_mean, baseline_std,
+            overall_mde_rel, n_seg, alpha, n_sim, r_squared, icc, cluster_size,
+        )
+        rows.append({
+            "segment":              seg["name"],
+            "fraction":             seg["fraction"],
+            "n_per_arm":            n_seg,
+            "implied_mde_pct":      round(implied_mde * 100, 2),
+            "mde_delta_pp":         round((implied_mde - overall_mde_rel) * 100, 2),
+            "power_at_overall_mde": round(power_at_overall, 3),
+            "adequately_powered":   power_at_overall >= target_power,
+        })
+    return sorted(rows, key=lambda r: r["implied_mde_pct"])
