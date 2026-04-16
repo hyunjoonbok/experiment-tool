@@ -871,17 +871,38 @@ def results_traffic_chart(metric_data: list, ctrl_name: str, treat_name: str) ->
 
 def subgroup_mde_chart(rows: list, overall_mde_pct: float, target_power: float = 0.80) -> alt.Chart:
     """
-    Horizontal bar chart showing implied MDE per segment.
-    Green = adequately powered at the overall MDE; orange = underpowered.
-    Dashed vertical line marks the overall experiment MDE.
+    Horizontal bar chart showing implied MDE per segment with power judgment embedded.
+    3-tier color: green (≥ target_power), yellow (≥ 75% of target), red (< 75%).
+    Power % shown inside each bar. Dashed reference line at overall experiment MDE.
     """
-    df = pd.DataFrame(rows)
+    thresh_hi = target_power
+    thresh_lo = target_power * 0.75
 
-    color_scale = alt.Scale(domain=[True, False], range=["#059669", "#f97316"])
+    enriched = []
+    for r in rows:
+        pwr = r["power_at_overall_mde"]
+        if pwr >= thresh_hi:
+            tier = "✓ Powered"
+            color = "#059669"
+        elif pwr >= thresh_lo:
+            tier = "~ Marginal"
+            color = "#d97706"
+        else:
+            tier = "✗ Underpowered"
+            color = "#dc2626"
+        enriched.append({**r, "tier": tier, "bar_color": color,
+                         "power_label": f"{pwr:.0%}"})
+
+    df = pd.DataFrame(enriched)
+
+    color_scale = alt.Scale(
+        domain=["✓ Powered", "~ Marginal", "✗ Underpowered"],
+        range=["#059669", "#d97706", "#dc2626"],
+    )
 
     bars = (
         alt.Chart(df)
-        .mark_bar(height=28, cornerRadiusEnd=4)
+        .mark_bar(height=32, cornerRadiusEnd=4)
         .encode(
             x=alt.X("implied_mde_pct:Q",
                     title="Implied MDE at target power (%)",
@@ -889,9 +910,9 @@ def subgroup_mde_chart(rows: list, overall_mde_pct: float, target_power: float =
             y=alt.Y("segment:N",
                     sort=alt.SortField("implied_mde_pct", order="ascending"),
                     title=None),
-            color=alt.Color("adequately_powered:N",
-                            scale=color_scale,
-                            legend=alt.Legend(title="Powered at overall MDE?")),
+            color=alt.Color("tier:N", scale=color_scale,
+                            legend=alt.Legend(title="Power at overall MDE",
+                                              orient="bottom", direction="horizontal")),
             tooltip=[
                 alt.Tooltip("segment:N", title="Segment"),
                 alt.Tooltip("fraction:Q", title="Traffic share", format=".0%"),
@@ -903,30 +924,37 @@ def subgroup_mde_chart(rows: list, overall_mde_pct: float, target_power: float =
         )
     )
 
-    labels = bars.mark_text(align="left", dx=4, fontSize=11).encode(
+    # MDE value label (right side of bar)
+    mde_labels = bars.mark_text(align="left", dx=6, fontSize=11, fontWeight="bold").encode(
         text=alt.Text("implied_mde_pct:Q", format=".1f"),
         color=alt.value("#1e293b"),
+    )
+
+    # Power % label inside each bar
+    power_labels = bars.mark_text(align="right", dx=-6, fontSize=11, fontWeight="bold").encode(
+        text=alt.Text("power_label:N"),
+        color=alt.value("white"),
     )
 
     ref_df = pd.DataFrame([{"overall": overall_mde_pct}])
     ref_line = (
         alt.Chart(ref_df)
-        .mark_rule(color="#1e293b", strokeWidth=2, strokeDash=[6, 3])
+        .mark_rule(color="#374151", strokeWidth=2, strokeDash=[5, 4])
         .encode(x="overall:Q")
     )
     ref_label = (
         alt.Chart(ref_df)
-        .mark_text(align="left", dx=4, dy=-6, fontSize=10,
-                   color="#1e293b", fontWeight="bold")
+        .mark_text(align="left", dx=5, dy=-8, fontSize=10,
+                   color="#374151", fontWeight="bold")
         .encode(
             x="overall:Q",
-            y=alt.value(8),
+            y=alt.value(6),
             text=alt.value(f"Overall MDE: {overall_mde_pct:.1f}%"),
         )
     )
 
     return (
-        (bars + labels + ref_line + ref_label)
-        .properties(height=max(40 * len(rows), 120))
+        (bars + mde_labels + power_labels + ref_line + ref_label)
+        .properties(height=max(48 * len(rows), 140))
         .configure_view(strokeWidth=0)
     )

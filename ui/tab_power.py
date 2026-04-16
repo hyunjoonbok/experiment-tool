@@ -618,16 +618,24 @@ accepting a wider MDE (right on the curve) would still answer the product questi
 # ── Sub-tab 4: Subgroup Power ─────────────────────────────
 
 _DEFAULT_SEG_NAMES = ["iOS users", "Android users", "New users",
-                      "Power users", "Mobile web", "Desktop"]
-_DEFAULT_SEG_FRACS = [40, 60, 25, 15, 30, 50]
+                      "Returning users", "Mobile web", "Desktop"]
+# Defaults sum to 100% for 3 segments (35+45+20); user adjusts for other counts.
+_DEFAULT_SEG_FRACS = [35, 45, 20, 15, 10, 5]
 
 
 def _render_subgroup_sub(p: dict) -> None:
-    st.markdown("**Subgroup analysis degrades sensitivity — quantify the cost before you launch.**")
+    st.info(
+        "**This tool is for Pre-Specified Subgroup Analysis only.** "
+        "Segments and their traffic shares must be defined *before* the experiment runs. "
+        "Post-hoc subgroup slicing (\"let's see how iOS users did after unblinding\") inflates "
+        "false positive rates and is not covered here — use **🔬 Multiple Testing** instead "
+        "to correct for looking at many slices after the fact.",
+        icon="📋",
+    )
     st.caption(
-        "Each subgroup contains only a fraction of your total traffic, so it has fewer users "
-        "per arm and a larger implied MDE. Enter your planned segments below to see exactly "
-        "how sensitive (or insensitive) each one is at your target power."
+        "Each pre-specified subgroup contains only a fraction of total traffic → fewer users per arm "
+        "→ larger implied MDE. Quantify this cost before launch so you know which segments "
+        "support confirmatory conclusions and which are directional only."
     )
 
     # ── Pull overall N + MDE from whichever prior sub-tab ran ─────────────
@@ -694,7 +702,21 @@ def _render_subgroup_sub(p: dict) -> None:
             )
             segments.append({"name": name or f"Segment {i+1}", "fraction": frac_pct / 100.0})
 
-    run = st.button("Compute Subgroup MDEs", type="primary", key="run_sub")
+    # ── Live traffic total + 100% validation ──────────────────────────────
+    total_pct = sum(s["fraction"] * 100 for s in segments)
+    total_ok = abs(total_pct - 100.0) <= 0.5   # allow ±0.5 pp rounding
+
+    if total_ok:
+        st.success(f"Traffic total: **{total_pct:.0f}%** ✓ — segments are mutually exclusive and exhaustive.")
+    else:
+        st.error(
+            f"Traffic shares must sum to **100%**. Currently: **{total_pct:.0f}%**. "
+            f"{'Add' if total_pct < 100 else 'Remove'} "
+            f"{abs(100 - total_pct):.0f} pp to proceed."
+        )
+
+    run = st.button("Compute Subgroup MDEs", type="primary", key="run_sub",
+                    disabled=not total_ok)
 
     if run:
         overall_mde_rel = overall_mde / 100.0
